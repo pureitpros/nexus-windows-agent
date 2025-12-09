@@ -1,0 +1,26 @@
+version: 1.0.{build}
+image: Visual Studio 2022
+
+before_build:
+  - nuget restore
+
+build:
+  project: NexusAgent.csproj
+  verbosity: minimal
+
+after_build:
+  - cmd: echo "Build complete"
+  - ps: |
+      $exePath = "bin\Release\net48\NexusAgent.exe"
+      $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
+      $padding = " " * (500 - $placeholder.Length)
+      $placeholderPadded = $placeholder + $padding
+      
+      $bytes = [System.IO.File]::ReadAllBytes($exePath)
+      $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($placeholderPadded)
+      $newBytes = $bytes + $placeholderBytes
+      [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
+
+artifacts:
+  - path: template.exe
+    name: NexusAgentTemplate
