@@ -1,4 +1,5 @@
 using System.ServiceProcess;
+using System.Runtime.InteropServices;
 
 namespace NexusAgent
 {
@@ -6,12 +7,19 @@ namespace NexusAgent
     {
         static void Main()
         {
-            ServiceBase[] ServicesToRun;
-            ServicesToRun = new ServiceBase[]
+            if (OperatingSystem.IsWindows())
             {
-                new NexusAgentService()
-            };
-            ServiceBase.Run(ServicesToRun);
+                ServiceBase[] ServicesToRun;
+                ServicesToRun = new ServiceBase[]
+                {
+                    new NexusAgentService()
+                };
+                ServiceBase.Run(ServicesToRun);
+            }
+            else
+            {
+                Console.WriteLine("This agent only runs on Windows");
+            }
         }
     }
 }
