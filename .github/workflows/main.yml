@@ -20,13 +20,13 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore NexusAgent.csproj
     
-    - name: Build
-      run: dotnet build NexusAgent.csproj --configuration Release --no-restore
+    - name: Publish
+      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
     
     - name: Add placeholder to EXE
       shell: pwsh
       run: |
-        $exePath = "bin\Release\net48\NexusAgent.exe"
+        $exePath = "bin\Release\net8.0\win-x64\publish\NexusAgent.exe"
         if (Test-Path $exePath) {
           $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
           $padding = " " * (500 - $placeholder.Length)
@@ -38,8 +38,10 @@ jobs:
           [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
           
           Write-Host "Template created successfully"
+          Write-Host "File size: $((Get-Item 'template.exe').Length) bytes"
         } else {
           Write-Host "EXE not found at $exePath"
+          Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName
           exit 1
         }
     
