@@ -6,7 +6,6 @@ using System.Text.Json;
 using System.ServiceProcess;
 using System.Timers;
 using System.Management.Automation;
-using System.Runtime.InteropServices;
 
 namespace NexusAgent
 {
@@ -71,11 +70,10 @@ namespace NexusAgent
         {
             try
             {
-                // Use AppContext.BaseDirectory for single-file apps
-                string exePath = Path.Combine(AppContext.BaseDirectory, AppDomain.CurrentDomain.FriendlyName);
-                if (!File.Exists(exePath))
+                string exePath = Environment.ProcessPath;
+                if (string.IsNullOrEmpty(exePath))
                 {
-                    exePath = Environment.ProcessPath ?? throw new Exception("Cannot find executable path");
+                    throw new Exception("Cannot find executable path");
                 }
 
                 byte[] exeBytes = File.ReadAllBytes(exePath);
@@ -93,7 +91,14 @@ namespace NexusAgent
                 Array.Copy(exeBytes, index, configBytes, 0, 500);
                 
                 string configJson = Encoding.UTF8.GetString(configBytes).TrimEnd(' ', '\0');
-                return JsonSerializer.Deserialize<AgentConfig>(configJson) ?? throw new Exception("Failed to deserialize config");
+                var config = JsonSerializer.Deserialize<AgentConfig>(configJson);
+                
+                if (config == null)
+                {
+                    throw new Exception("Failed to deserialize config");
+                }
+                
+                return config;
             }
             catch (Exception ex)
             {
@@ -133,7 +138,7 @@ namespace NexusAgent
             try
             {
                 LogEvent($"Executing: {command.command_type}");
-                UpdateCommandStatus(command.id, "running", null, null);
+                UpdateCommandStatus(command.id, "running", "", "");
 
                 string output = "";
                 string error = "";
@@ -152,7 +157,7 @@ namespace NexusAgent
             }
             catch (Exception ex)
             {
-                UpdateCommandStatus(command.id, "failed", null, ex.Message);
+                UpdateCommandStatus(command.id, "failed", "", ex.Message);
             }
         }
 
@@ -186,7 +191,7 @@ namespace NexusAgent
             }
         }
 
-        private void UpdateCommandStatus(string commandId, string status, string? output, string? error)
+        private void UpdateCommandStatus(string commandId, string status, string output, string error)
         {
             try
             {
@@ -255,7 +260,12 @@ namespace NexusAgent
                     "agent.log"
                 );
                 
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? "");
+                string directory = Path.GetDirectoryName(logPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                
                 File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}\n");
             }
             catch { }
@@ -274,6 +284,6 @@ namespace NexusAgent
     {
         public string id { get; set; } = "";
         public string command_type { get; set; } = "";
-        public string? script { get; set; }
+        public string script { get; set; } = "";
     }
 }
