@@ -1,5 +1,5 @@
+using System;
 using System.ServiceProcess;
-using System.Runtime.InteropServices;
 
 namespace NexusAgent
 {
