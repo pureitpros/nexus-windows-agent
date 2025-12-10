@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.ServiceProcess;
 using System.Timers;
 using System.Management.Automation;
+using System.Runtime.InteropServices;
 
 namespace NexusAgent
 {
@@ -18,10 +19,13 @@ namespace NexusAgent
 
         public NexusAgentService()
         {
-            ServiceName = "NEXUS Agent";
-            CanStop = true;
-            CanPauseAndContinue = false;
-            AutoLog = true;
+            if (OperatingSystem.IsWindows())
+            {
+                ServiceName = "NEXUS Agent";
+                CanStop = true;
+                CanPauseAndContinue = false;
+                AutoLog = true;
+            }
         }
 
         protected override void OnStart(string[] args)
@@ -67,7 +71,13 @@ namespace NexusAgent
         {
             try
             {
-                string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                // Use AppContext.BaseDirectory for single-file apps
+                string exePath = Path.Combine(AppContext.BaseDirectory, AppDomain.CurrentDomain.FriendlyName);
+                if (!File.Exists(exePath))
+                {
+                    exePath = Environment.ProcessPath ?? throw new Exception("Cannot find executable path");
+                }
+
                 byte[] exeBytes = File.ReadAllBytes(exePath);
                 
                 string placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>";
@@ -83,7 +93,7 @@ namespace NexusAgent
                 Array.Copy(exeBytes, index, configBytes, 0, 500);
                 
                 string configJson = Encoding.UTF8.GetString(configBytes).TrimEnd(' ', '\0');
-                return JsonSerializer.Deserialize<AgentConfig>(configJson);
+                return JsonSerializer.Deserialize<AgentConfig>(configJson) ?? throw new Exception("Failed to deserialize config");
             }
             catch (Exception ex)
             {
@@ -176,7 +186,7 @@ namespace NexusAgent
             }
         }
 
-        private void UpdateCommandStatus(string commandId, string status, string output, string error)
+        private void UpdateCommandStatus(string commandId, string status, string? output, string? error)
         {
             try
             {
@@ -245,7 +255,7 @@ namespace NexusAgent
                     "agent.log"
                 );
                 
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? "");
                 File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}\n");
             }
             catch { }
@@ -254,16 +264,16 @@ namespace NexusAgent
 
     public class AgentConfig
     {
-        public string supabase_url { get; set; }
-        public string supabase_key { get; set; }
-        public string deployment_id { get; set; }
-        public string secret_key { get; set; }
+        public string supabase_url { get; set; } = "";
+        public string supabase_key { get; set; } = "";
+        public string deployment_id { get; set; } = "";
+        public string secret_key { get; set; } = "";
     }
 
     public class AgentCommand
     {
-        public string id { get; set; }
-        public string command_type { get; set; }
-        public string script { get; set; }
+        public string id { get; set; } = "";
+        public string command_type { get; set; } = "";
+        public string? script { get; set; }
     }
 }
