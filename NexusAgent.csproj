@@ -2,8 +2,8 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <!-- Remove hardcoded SelfContained - let publish command decide -->
+    <!-- Do NOT specify RuntimeIdentifier here - let publish command handle it -->
+    <!-- Do NOT specify SelfContained here - let publish command handle it -->
     <PublishSingleFile>true</PublishSingleFile>
   </PropertyGroup>
   
