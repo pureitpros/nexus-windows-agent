@@ -23,16 +23,25 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore NexusAgent.csproj
     
-    - name: Publish (Framework-Dependent - Small Size)
-      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+    - name: Publish (Framework-Dependent - Override ALL settings)
+      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./output
     
-    - name: Add placeholder to EXE
+    - name: Verify and add placeholder to EXE
       shell: pwsh
       run: |
-        $exePath = "bin\Release\net8.0\win-x64\publish\NexusAgent.exe"
+        $exePath = "./output/NexusAgent.exe"
         if (Test-Path $exePath) {
-          Write-Host "Original EXE found"
-          Write-Host "Size: $((Get-Item $exePath).Length) bytes"
+          Write-Host "✓ EXE found at: $exePath"
+          $originalSize = (Get-Item $exePath).Length
+          Write-Host "Original size: $originalSize bytes ($([math]::Round($originalSize/1KB, 2)) KB / $([math]::Round($originalSize/1MB, 2)) MB)"
+          
+          # Check if it's actually framework-dependent
+          if ($originalSize -gt 10000000) {
+            Write-Host "WARNING: File is larger than 10MB! This might still be self-contained." -ForegroundColor Yellow
+            Write-Host "Continuing anyway, but investigate if this persists..." -ForegroundColor Yellow
+          } else {
+            Write-Host "✓ File size looks correct for framework-dependent build!" -ForegroundColor Green
+          }
           
           $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
           $padding = " " * (500 - $placeholder.Length)
@@ -45,11 +54,11 @@ jobs:
           
           Write-Host "Template created successfully"
           $templateSize = (Get-Item 'template.exe').Length
-          Write-Host "Template size: $templateSize bytes ($([math]::Round($templateSize/1KB, 2)) KB)"
+          Write-Host "Template size: $templateSize bytes ($([math]::Round($templateSize/1KB, 2)) KB / $([math]::Round($templateSize/1MB, 2)) MB)"
         } else {
-          Write-Host "EXE not found at $exePath"
-          Write-Host "Searching for EXE files:"
-          Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName
+          Write-Host "✗ EXE not found at $exePath" -ForegroundColor Red
+          Write-Host "Searching for EXE files:" -ForegroundColor Yellow
+          Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName, @{Name="Size(KB)";Expression={[math]::Round($_.Length/1KB,2)}}
           exit 1
         }
     
@@ -68,15 +77,17 @@ jobs:
         body: |
           ## NEXUS Windows Agent - Framework-Dependent Build
           
-          **File Size:** ~500KB (requires .NET 8 Runtime)
+          **IMPORTANT:** Check the file size in the Assets below.
+          - ✅ Should be ~500KB-1MB (framework-dependent - GOOD)
+          - ❌ If ~112MB (self-contained - BAD, investigate .csproj)
           
           ### Prerequisites:
           - .NET 8 Runtime must be installed on target machine
           - Download: https://dotnet.microsoft.com/download/dotnet/8.0
           
           ### Changes:
-          - Reduced from 112MB to ~500KB
-          - Requires .NET 8 Runtime (most servers have this)
+          - Attempting framework-dependent build (requires .NET 8 Runtime)
+          - If successful: Reduced from 112MB to ~500KB
           - Faster deployment through N8N
         files: template.exe
       env:
