@@ -20,14 +20,17 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore NexusAgent.csproj
     
-    - name: Publish
-      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+    - name: Publish (Framework-Dependent - Small Size)
+      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
     
     - name: Add placeholder to EXE
       shell: pwsh
       run: |
         $exePath = "bin\Release\net8.0\win-x64\publish\NexusAgent.exe"
         if (Test-Path $exePath) {
+          Write-Host "Original EXE found"
+          Write-Host "Size: $((Get-Item $exePath).Length) bytes"
+          
           $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
           $padding = " " * (500 - $placeholder.Length)
           $placeholderPadded = $placeholder + $padding
@@ -38,9 +41,11 @@ jobs:
           [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
           
           Write-Host "Template created successfully"
-          Write-Host "File size: $((Get-Item 'template.exe').Length) bytes"
+          $templateSize = (Get-Item 'template.exe').Length
+          Write-Host "Template size: $templateSize bytes ($([math]::Round($templateSize/1KB, 2)) KB)"
         } else {
           Write-Host "EXE not found at $exePath"
+          Write-Host "Searching for EXE files:"
           Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName
           exit 1
         }
@@ -50,3 +55,26 @@ jobs:
       with:
         name: nexus-agent-template
         path: template.exe
+    
+    - name: Create Release
+      if: github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: agent-v1.0.${{ github.run_number }}
+        name: NEXUS Agent v1.0.${{ github.run_number }}
+        body: |
+          ## NEXUS Windows Agent - Framework-Dependent Build
+          
+          **File Size:** ~500KB (requires .NET 8 Runtime)
+          
+          ### Prerequisites:
+          - .NET 8 Runtime must be installed on target machine
+          - Download: https://dotnet.microsoft.com/download/dotnet/8.0
+          
+          ### Changes:
+          - Reduced from 112MB to ~500KB
+          - Requires .NET 8 Runtime (most servers have this)
+          - Faster deployment through N8N
+        files: template.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
