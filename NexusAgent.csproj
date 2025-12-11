@@ -3,7 +3,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
+    <!-- Remove hardcoded SelfContained - let publish command decide -->
     <PublishSingleFile>true</PublishSingleFile>
   </PropertyGroup>
   
