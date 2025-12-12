@@ -30,33 +30,26 @@ jobs:
     - name: Create template.exe with placeholder
       shell: pwsh
       run: |
-        $exePath = "bin\Release\NexusAgent.exe"
+        $exePath = "bin\Any CPU\Release\net48\NexusAgent.exe"
+        Write-Host "Looking for: $exePath"
         
         if (Test-Path $exePath) {
           Write-Host "Found executable at $exePath"
-          
-          # Create placeholder string (500 bytes for credentials JSON)
           $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
           $padding = " " * (500 - $placeholder.Length)
           $placeholderPadded = $placeholder + $padding
           
-          # Read original exe and append placeholder
-          $exeBytes = [System.IO.File]::ReadAllBytes($exePath)
+          $bytes = [System.IO.File]::ReadAllBytes($exePath)
           $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($placeholderPadded)
-          $templateBytes = New-Object byte[] ($exeBytes.Length + $placeholderBytes.Length)
+          $newBytes = $bytes + $placeholderBytes
+          [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
           
-          [System.Array]::Copy($exeBytes, 0, $templateBytes, 0, $exeBytes.Length)
-          [System.Array]::Copy($placeholderBytes, 0, $templateBytes, $exeBytes.Length, $placeholderBytes.Length)
-          
-          [System.IO.File]::WriteAllBytes("template.exe", $templateBytes)
-          
-          Write-Host "Created template.exe successfully"
-          Write-Host "Original size: $($exeBytes.Length) bytes"
-          Write-Host "Template size: $($templateBytes.Length) bytes"
+          $size = (Get-Item "template.exe").Length
+          Write-Host "Created template.exe successfully ($size bytes)"
         } else {
           Write-Host "ERROR: Executable not found at $exePath"
           Write-Host "Searching for .exe files..."
-          Get-ChildItem -Recurse -Filter "*.exe" | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem -Recurse -Filter "NexusAgent.exe" | ForEach-Object { Write-Host $_.FullName }
           exit 1
         }
 
@@ -65,4 +58,3 @@ jobs:
       with:
         name: nexus-agent-template
         path: template.exe
-        if-no-files-found: error
