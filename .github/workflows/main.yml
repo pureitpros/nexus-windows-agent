@@ -1,94 +1,68 @@
-name: Build Windows Agent
+name: Build NEXUS Agent
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v3
-      with:
-        dotnet-version: '8.0.x'
-    
-    - name: Restore dependencies
-      run: dotnet restore NexusAgent.csproj
-    
-    - name: Publish (Framework-Dependent - Override ALL settings)
-      run: dotnet publish NexusAgent.csproj -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./output
-    
-    - name: Verify and add placeholder to EXE
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v1
+
+    - name: Restore NuGet packages
+      run: nuget restore NexusAgent.csproj
+
+    - name: Build with MSBuild
+      run: msbuild NexusAgent.csproj /p:Configuration=Release /p:Platform="Any CPU"
+
+    - name: Create template.exe with placeholder
       shell: pwsh
       run: |
-        $exePath = "./output/NexusAgent.exe"
+        $exePath = "bin\Release\NexusAgent.exe"
+        
         if (Test-Path $exePath) {
-          Write-Host "✓ EXE found at: $exePath"
-          $originalSize = (Get-Item $exePath).Length
-          Write-Host "Original size: $originalSize bytes ($([math]::Round($originalSize/1KB, 2)) KB / $([math]::Round($originalSize/1MB, 2)) MB)"
+          Write-Host "Found executable at $exePath"
           
-          # Check if it's actually framework-dependent
-          if ($originalSize -gt 10000000) {
-            Write-Host "WARNING: File is larger than 10MB! This might still be self-contained." -ForegroundColor Yellow
-            Write-Host "Continuing anyway, but investigate if this persists..." -ForegroundColor Yellow
-          } else {
-            Write-Host "✓ File size looks correct for framework-dependent build!" -ForegroundColor Green
-          }
-          
+          # Create placeholder string (500 bytes for credentials JSON)
           $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
           $padding = " " * (500 - $placeholder.Length)
           $placeholderPadded = $placeholder + $padding
           
-          $bytes = [System.IO.File]::ReadAllBytes($exePath)
+          # Read original exe and append placeholder
+          $exeBytes = [System.IO.File]::ReadAllBytes($exePath)
           $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($placeholderPadded)
-          $newBytes = $bytes + $placeholderBytes
-          [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
+          $templateBytes = New-Object byte[] ($exeBytes.Length + $placeholderBytes.Length)
           
-          Write-Host "Template created successfully"
-          $templateSize = (Get-Item 'template.exe').Length
-          Write-Host "Template size: $templateSize bytes ($([math]::Round($templateSize/1KB, 2)) KB / $([math]::Round($templateSize/1MB, 2)) MB)"
+          [System.Array]::Copy($exeBytes, 0, $templateBytes, 0, $exeBytes.Length)
+          [System.Array]::Copy($placeholderBytes, 0, $templateBytes, $exeBytes.Length, $placeholderBytes.Length)
+          
+          [System.IO.File]::WriteAllBytes("template.exe", $templateBytes)
+          
+          Write-Host "Created template.exe successfully"
+          Write-Host "Original size: $($exeBytes.Length) bytes"
+          Write-Host "Template size: $($templateBytes.Length) bytes"
         } else {
-          Write-Host "✗ EXE not found at $exePath" -ForegroundColor Red
-          Write-Host "Searching for EXE files:" -ForegroundColor Yellow
-          Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName, @{Name="Size(KB)";Expression={[math]::Round($_.Length/1KB,2)}}
+          Write-Host "ERROR: Executable not found at $exePath"
+          Write-Host "Searching for .exe files..."
+          Get-ChildItem -Recurse -Filter "*.exe" | ForEach-Object { Write-Host $_.FullName }
           exit 1
         }
-    
-    - name: Upload artifact
+
+    - name: Upload template artifact
       uses: actions/upload-artifact@v4
       with:
         name: nexus-agent-template
         path: template.exe
-    
-    - name: Create Release
-      if: github.ref == 'refs/heads/main'
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: agent-v1.0.${{ github.run_number }}
-        name: NEXUS Agent v1.0.${{ github.run_number }}
-        body: |
-          ## NEXUS Windows Agent - Framework-Dependent Build
-          
-          **IMPORTANT:** Check the file size in the Assets below.
-          - ✅ Should be ~500KB-1MB (framework-dependent - GOOD)
-          - ❌ If ~112MB (self-contained - BAD, investigate .csproj)
-          
-          ### Prerequisites:
-          - .NET 8 Runtime must be installed on target machine
-          - Download: https://dotnet.microsoft.com/download/dotnet/8.0
-          
-          ### Changes:
-          - Attempting framework-dependent build (requires .NET 8 Runtime)
-          - If successful: Reduced from 112MB to ~500KB
-          - Faster deployment through N8N
-        files: template.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if-no-files-found: error
