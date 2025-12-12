@@ -14,13 +14,19 @@ namespace NexusAgent
     public class NexusAgentService : ServiceBase
     {
         private CancellationTokenSource _cancellationTokenSource;
-        private Task _heartbeatTask;
-        private readonly HttpClient _httpClient;
+        private Task _mainTask;
+        private HttpClient _httpClient;
+        private Timer _heartbeatTimer;
+        private Timer _commandTimer;
         
+        // Credentials read from embedded data
         private string _supabaseUrl;
         private string _supabaseKey;
-        private string _secretKey;
         private string _deploymentId;
+        private string _secretKey;
+        
+        // Installation ID for this agent instance
+        private string _installationId;
         
         private const int CREDENTIALS_SIZE = 500;
 
@@ -30,80 +36,97 @@ namespace NexusAgent
             CanStop = true;
             CanPauseAndContinue = false;
             AutoLog = true;
-            
-            _httpClient = new HttpClient();
-            _httpClient.Timeout = TimeSpan.FromSeconds(30);
         }
 
         protected override void OnStart(string[] args)
         {
-            try
-            {
-                WriteLog("NEXUS Agent starting...");
-                
-                if (!LoadCredentials())
-                {
-                    WriteLog("Failed to load credentials. Service cannot start.");
-                    Stop();
-                    return;
-                }
-                
-                WriteLog($"Credentials loaded. Deployment: {_deploymentId}");
-                WriteLog($"Supabase URL: {_supabaseUrl}");
-                
-                // Set up HTTP client headers
-                _httpClient.DefaultRequestHeaders.Clear();
-                _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
-                _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
-                
-                _cancellationTokenSource = new CancellationTokenSource();
-                _heartbeatTask = Task.Run(() => HeartbeatLoop(_cancellationTokenSource.Token));
-                
-                WriteLog("NEXUS Agent started successfully.");
-            }
-            catch (Exception ex)
-            {
-                WriteLog($"Error starting service: {ex.Message}");
-                throw;
-            }
+            _cancellationTokenSource = new CancellationTokenSource();
+            _mainTask = Task.Run(() => RunAgent(_cancellationTokenSource.Token));
         }
 
         protected override void OnStop()
         {
-            WriteLog("NEXUS Agent stopping...");
+            _cancellationTokenSource?.Cancel();
+            _heartbeatTimer?.Dispose();
+            _commandTimer?.Dispose();
+            _httpClient?.Dispose();
             
             try
             {
-                _cancellationTokenSource?.Cancel();
-                
-                if (_heartbeatTask != null)
-                {
-                    _heartbeatTask.Wait(TimeSpan.FromSeconds(5));
-                }
+                _mainTask?.Wait(TimeSpan.FromSeconds(10));
             }
-            catch (Exception ex)
-            {
-                WriteLog($"Error during shutdown: {ex.Message}");
-            }
-            
-            _httpClient?.Dispose();
-            WriteLog("NEXUS Agent stopped.");
+            catch { }
         }
 
-        private bool LoadCredentials()
+        private async Task RunAgent(CancellationToken cancellationToken)
         {
             try
             {
-                // Get the path to this executable
+                // Read embedded credentials from the executable
+                if (!ReadEmbeddedCredentials())
+                {
+                    LogError("Failed to read embedded credentials");
+                    return;
+                }
+
+                LogInfo($"NEXUS Agent starting for deployment: {_deploymentId}");
+                
+                // Initialize HTTP client
+                _httpClient = new HttpClient();
+                _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
+                _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+                
+                // Register or update this agent installation
+                await RegisterAgent();
+                
+                // Start heartbeat timer (every 60 seconds)
+                _heartbeatTimer = new Timer(
+                    async _ => await SendHeartbeat(),
+                    null,
+                    TimeSpan.Zero,
+                    TimeSpan.FromSeconds(60)
+                );
+                
+                // Start command polling timer (every 10 seconds)
+                _commandTimer = new Timer(
+                    async _ => await PollForCommands(),
+                    null,
+                    TimeSpan.FromSeconds(5),
+                    TimeSpan.FromSeconds(10)
+                );
+                
+                LogInfo("NEXUS Agent started successfully");
+                
+                // Keep running until cancelled
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await Task.Delay(1000, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                LogInfo("NEXUS Agent stopping...");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Agent error: {ex.Message}");
+            }
+        }
+
+        private bool ReadEmbeddedCredentials()
+        {
+            try
+            {
+                // Get the path to the currently running executable
                 string exePath = Assembly.GetExecutingAssembly().Location;
-                WriteLog($"Loading credentials from: {exePath}");
+                
+                LogInfo($"Reading credentials from: {exePath}");
                 
                 byte[] exeBytes = File.ReadAllBytes(exePath);
-                WriteLog($"Executable size: {exeBytes.Length} bytes");
                 
                 if (exeBytes.Length < CREDENTIALS_SIZE)
                 {
-                    WriteLog("Executable too small to contain credentials");
+                    LogError("Executable too small to contain credentials");
                     return false;
                 }
                 
@@ -112,88 +135,90 @@ namespace NexusAgent
                 Array.Copy(exeBytes, exeBytes.Length - CREDENTIALS_SIZE, credentialsBytes, 0, CREDENTIALS_SIZE);
                 
                 // Convert to string and trim null bytes
-                string credentialsJson = Encoding.UTF8.GetString(credentialsBytes).TrimEnd('\0').Trim();
-                WriteLog($"Raw credentials string (first 100 chars): {credentialsJson.Substring(0, Math.Min(100, credentialsJson.Length))}");
+                string credentialsJson = Encoding.UTF8.GetString(credentialsBytes).TrimEnd('\0', ' ');
                 
-                // Find the start of the JSON object
-                int jsonStart = credentialsJson.IndexOf('{');
-                if (jsonStart < 0)
+                LogInfo($"Raw credentials length: {credentialsJson.Length}");
+                
+                // Check if it's still the placeholder
+                if (credentialsJson.Contains("<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"))
                 {
-                    WriteLog("No JSON object found in credentials");
+                    LogError("Agent executable has not been configured with credentials");
                     return false;
                 }
                 
-                credentialsJson = credentialsJson.Substring(jsonStart);
-                
-                // Find the end of the JSON object
-                int braceCount = 0;
-                int jsonEnd = -1;
-                for (int i = 0; i < credentialsJson.Length; i++)
-                {
-                    if (credentialsJson[i] == '{') braceCount++;
-                    if (credentialsJson[i] == '}') braceCount--;
-                    if (braceCount == 0)
-                    {
-                        jsonEnd = i + 1;
-                        break;
-                    }
-                }
-                
-                if (jsonEnd > 0)
-                {
-                    credentialsJson = credentialsJson.Substring(0, jsonEnd);
-                }
-                
-                WriteLog($"Parsed JSON: {credentialsJson}");
-                
+                // Parse JSON
                 var credentials = JObject.Parse(credentialsJson);
                 
                 _supabaseUrl = credentials["supabase_url"]?.ToString();
                 _supabaseKey = credentials["supabase_key"]?.ToString();
-                _secretKey = credentials["secret_key"]?.ToString();
                 _deploymentId = credentials["deployment_id"]?.ToString();
+                _secretKey = credentials["secret_key"]?.ToString();
                 
-                if (string.IsNullOrEmpty(_supabaseUrl) || string.IsNullOrEmpty(_supabaseKey) || 
-                    string.IsNullOrEmpty(_secretKey) || string.IsNullOrEmpty(_deploymentId))
+                if (string.IsNullOrEmpty(_supabaseUrl) || 
+                    string.IsNullOrEmpty(_supabaseKey) || 
+                    string.IsNullOrEmpty(_deploymentId) || 
+                    string.IsNullOrEmpty(_secretKey))
                 {
-                    WriteLog("One or more credentials are missing");
-                    WriteLog($"URL: {!string.IsNullOrEmpty(_supabaseUrl)}, Key: {!string.IsNullOrEmpty(_supabaseKey)}, Secret: {!string.IsNullOrEmpty(_secretKey)}, Deployment: {!string.IsNullOrEmpty(_deploymentId)}");
+                    LogError("Missing required credential fields");
                     return false;
                 }
                 
+                LogInfo($"Credentials loaded successfully for deployment: {_deploymentId}");
                 return true;
             }
             catch (Exception ex)
             {
-                WriteLog($"Error loading credentials: {ex.Message}");
-                WriteLog($"Stack trace: {ex.StackTrace}");
+                LogError($"Failed to read credentials: {ex.Message}");
                 return false;
             }
         }
 
-        private async Task HeartbeatLoop(CancellationToken cancellationToken)
+        private async Task RegisterAgent()
         {
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-                try
-                {
-                    await SendHeartbeat();
-                    await CheckForCommands();
-                }
-                catch (Exception ex)
-                {
-                    WriteLog($"Heartbeat error: {ex.Message}");
-                }
+                string hostname = Environment.MachineName;
+                string url = $"{_supabaseUrl}/rest/v1/agent_installations?secret_key=eq.{_secretKey}";
                 
-                // Wait 30 seconds before next heartbeat
-                try
+                var response = await _httpClient.GetAsync(url);
+                var content = await response.Content.ReadAsStringAsync();
+                var installations = JArray.Parse(content);
+                
+                if (installations.Count > 0)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                    // Update existing installation
+                    _installationId = installations[0]["id"]?.ToString();
+                    
+                    var updateData = new
+                    {
+                        hostname = hostname,
+                        last_heartbeat = DateTime.UtcNow.ToString("o"),
+                        status = "connected",
+                        agent_version = "1.0.0"
+                    };
+                    
+                    string updateUrl = $"{_supabaseUrl}/rest/v1/agent_installations?id=eq.{_installationId}";
+                    var updateContent = new StringContent(
+                        JsonConvert.SerializeObject(updateData),
+                        Encoding.UTF8,
+                        "application/json"
+                    );
+                    
+                    // Use SendAsync with PATCH method (PatchAsync not available in .NET Framework 4.8)
+                    var request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl);
+                    request.Content = updateContent;
+                    await _httpClient.SendAsync(request);
+                    
+                    LogInfo($"Updated agent registration: {_installationId}");
                 }
-                catch (TaskCanceledException)
+                else
                 {
-                    break;
+                    LogError("No matching agent installation found for secret key");
                 }
+            }
+            catch (Exception ex)
+            {
+                LogError($"Failed to register agent: {ex.Message}");
             }
         }
 
@@ -201,100 +226,103 @@ namespace NexusAgent
         {
             try
             {
-                string hostname = Environment.MachineName;
-                string url = $"{_supabaseUrl}/rest/v1/agent_installations?deployment_id=eq.{_deploymentId}&secret_key=eq.{_secretKey}";
+                if (string.IsNullOrEmpty(_installationId)) return;
                 
-                var payload = new
+                var updateData = new
                 {
                     last_heartbeat = DateTime.UtcNow.ToString("o"),
-                    hostname = hostname,
-                    agent_version = "1.0.0",
                     status = "connected"
                 };
                 
-                string jsonPayload = JsonConvert.SerializeObject(payload);
-                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-                content.Headers.Add("Prefer", "return=minimal");
+                string url = $"{_supabaseUrl}/rest/v1/agent_installations?id=eq.{_installationId}";
+                var content = new StringContent(
+                    JsonConvert.SerializeObject(updateData),
+                    Encoding.UTF8,
+                    "application/json"
+                );
                 
-                var response = await _httpClient.PatchAsync(url, content);
+                // Use SendAsync with PATCH method (PatchAsync not available in .NET Framework 4.8)
+                var request = new HttpRequestMessage(new HttpMethod("PATCH"), url);
+                request.Content = content;
+                await _httpClient.SendAsync(request);
                 
-                if (!response.IsSuccessStatusCode)
-                {
-                    string responseBody = await response.Content.ReadAsStringAsync();
-                    WriteLog($"Heartbeat failed: {response.StatusCode} - {responseBody}");
-                }
-                else
-                {
-                    WriteLog("Heartbeat sent successfully");
-                }
+                LogInfo("Heartbeat sent");
             }
             catch (Exception ex)
             {
-                WriteLog($"Error sending heartbeat: {ex.Message}");
+                LogError($"Heartbeat failed: {ex.Message}");
             }
         }
 
-        private async Task CheckForCommands()
+        private async Task PollForCommands()
         {
             try
             {
-                string url = $"{_supabaseUrl}/rest/v1/agent_commands?deployment_id=eq.{_deploymentId}&status=eq.pending&order=created_at.asc&limit=1";
+                if (string.IsNullOrEmpty(_installationId)) return;
+                
+                string url = $"{_supabaseUrl}/rest/v1/agent_commands?installation_id=eq.{_installationId}&status=eq.pending&order=created_at.asc&limit=1";
                 
                 var response = await _httpClient.GetAsync(url);
+                var content = await response.Content.ReadAsStringAsync();
+                var commands = JArray.Parse(content);
                 
-                if (response.IsSuccessStatusCode)
+                if (commands.Count > 0)
                 {
-                    string body = await response.Content.ReadAsStringAsync();
-                    var commands = JArray.Parse(body);
+                    var command = commands[0];
+                    string commandId = command["id"]?.ToString();
+                    string commandType = command["command_type"]?.ToString();
+                    string commandData = command["command_data"]?.ToString();
                     
-                    if (commands.Count > 0)
-                    {
-                        var command = commands[0];
-                        string commandId = command["id"]?.ToString();
-                        string commandType = command["command_type"]?.ToString();
-                        string commandPayload = command["payload"]?.ToString();
-                        
-                        WriteLog($"Received command: {commandType}");
-                        
-                        await ExecuteCommand(commandId, commandType, commandPayload);
-                    }
+                    LogInfo($"Executing command: {commandType}");
+                    
+                    // Mark command as running
+                    await UpdateCommandStatus(commandId, "running", null);
+                    
+                    // Execute the command
+                    string result = await ExecuteCommand(commandType, commandData);
+                    
+                    // Mark command as completed
+                    await UpdateCommandStatus(commandId, "completed", result);
+                    
+                    LogInfo($"Command completed: {commandType}");
                 }
             }
             catch (Exception ex)
             {
-                WriteLog($"Error checking commands: {ex.Message}");
+                LogError($"Command polling failed: {ex.Message}");
             }
         }
 
-        private async Task ExecuteCommand(string commandId, string commandType, string payload)
+        private async Task<string> ExecuteCommand(string commandType, string commandData)
         {
-            string result = "";
-            string status = "completed";
-            
             try
             {
                 switch (commandType?.ToLower())
                 {
-                    case "ping":
-                        result = "pong";
-                        break;
                     case "powershell":
-                        result = await ExecutePowerShell(payload);
-                        break;
+                        return await ExecutePowerShell(commandData);
+                    
+                    case "ping":
+                        return $"Pong from {Environment.MachineName} at {DateTime.UtcNow:o}";
+                    
+                    case "info":
+                        return JsonConvert.SerializeObject(new
+                        {
+                            hostname = Environment.MachineName,
+                            os = Environment.OSVersion.ToString(),
+                            dotnet = Environment.Version.ToString(),
+                            processors = Environment.ProcessorCount,
+                            uptime = Environment.TickCount / 1000
+                        });
+                    
                     default:
-                        result = $"Unknown command type: {commandType}";
-                        status = "failed";
-                        break;
+                        return $"Unknown command type: {commandType}";
                 }
             }
             catch (Exception ex)
             {
-                result = $"Error: {ex.Message}";
-                status = "failed";
+                return $"Error executing command: {ex.Message}";
             }
-            
-            // Update command status
-            await UpdateCommandStatus(commandId, status, result);
         }
 
         private async Task<string> ExecutePowerShell(string script)
@@ -316,11 +344,11 @@ namespace NexusAgent
                     string output = await process.StandardOutput.ReadToEndAsync();
                     string error = await process.StandardError.ReadToEndAsync();
                     
-                    process.WaitForExit(60000); // 60 second timeout
+                    process.WaitForExit();
                     
                     if (!string.IsNullOrEmpty(error))
                     {
-                        return $"Output:\n{output}\n\nErrors:\n{error}";
+                        return $"Error: {error}\nOutput: {output}";
                     }
                     
                     return output;
@@ -328,7 +356,7 @@ namespace NexusAgent
             }
             catch (Exception ex)
             {
-                return $"PowerShell execution error: {ex.Message}";
+                return $"PowerShell execution failed: {ex.Message}";
             }
         }
 
@@ -336,43 +364,65 @@ namespace NexusAgent
         {
             try
             {
-                string url = $"{_supabaseUrl}/rest/v1/agent_commands?id=eq.{commandId}";
-                
-                var payload = new
+                var updateData = new
                 {
                     status = status,
                     result = result,
-                    completed_at = DateTime.UtcNow.ToString("o")
+                    executed_at = status == "completed" ? DateTime.UtcNow.ToString("o") : null
                 };
                 
-                string jsonPayload = JsonConvert.SerializeObject(payload);
-                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-                content.Headers.Add("Prefer", "return=minimal");
+                string url = $"{_supabaseUrl}/rest/v1/agent_commands?id=eq.{commandId}";
+                var content = new StringContent(
+                    JsonConvert.SerializeObject(updateData),
+                    Encoding.UTF8,
+                    "application/json"
+                );
                 
-                await _httpClient.PatchAsync(url, content);
+                // Use SendAsync with PATCH method (PatchAsync not available in .NET Framework 4.8)
+                var request = new HttpRequestMessage(new HttpMethod("PATCH"), url);
+                request.Content = content;
+                await _httpClient.SendAsync(request);
             }
             catch (Exception ex)
             {
-                WriteLog($"Error updating command status: {ex.Message}");
+                LogError($"Failed to update command status: {ex.Message}");
             }
         }
 
-        private void WriteLog(string message)
+        private void LogInfo(string message)
         {
             try
             {
-                string logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "NexusAgent");
-                Directory.CreateDirectory(logDir);
+                string logPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "NexusAgent",
+                    "agent.log"
+                );
                 
-                string logFile = Path.Combine(logDir, "nexus-agent.log");
-                string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}\n";
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
                 
-                File.AppendAllText(logFile, logEntry);
+                string logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [INFO] {message}{Environment.NewLine}";
+                File.AppendAllText(logPath, logMessage);
             }
-            catch
+            catch { }
+        }
+
+        private void LogError(string message)
+        {
+            try
             {
-                // Ignore logging errors
+                string logPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "NexusAgent",
+                    "agent.log"
+                );
+                
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+                
+                string logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [ERROR] {message}{Environment.NewLine}";
+                File.AppendAllText(logPath, logMessage);
             }
+            catch { }
         }
     }
 }
