@@ -9,61 +9,130 @@ namespace NexusAgent
     {
         static void Main(string[] args)
         {
-            // Get the path to this executable
             string exePath = Assembly.GetExecutingAssembly().Location;
-            
-            // Check if running as a service or in console mode
-            if (Environment.UserInteractive)
-            {
-                // Running from command line - handle install/uninstall
-                if (args.Length > 0)
-                {
-                    switch (args[0].ToLower())
-                    {
-                        case "/install":
-                        case "-install":
-                        case "--install":
-                            ManagedInstallerClass.InstallHelper(new string[] { exePath });
-                            Console.WriteLine("NEXUS Agent service installed successfully.");
-                            return;
-                        case "/uninstall":
-                        case "-uninstall":
-                        case "--uninstall":
-                            ManagedInstallerClass.InstallHelper(new string[] { "/u", exePath });
-                            Console.WriteLine("NEXUS Agent service uninstalled successfully.");
-                            return;
-                    }
-                }
 
-                // Default: Install and start the service
-                try
+            if (args.Length > 0)
+            {
+                string command = args[0].ToLower();
+
+                if (command == "/install" || command == "-install" || command == "--install")
                 {
                     Console.WriteLine("Installing NEXUS Agent service...");
-                    
-                    // Check if already installed
-                    ServiceController[] services = ServiceController.GetServices();
-                    bool isInstalled = false;
-                    foreach (ServiceController svc in services)
-                    {
-                        if (svc.ServiceName == "NexusAgent")
-                        {
-                            isInstalled = true;
-                            break;
-                        }
-                    }
-
-                    if (!isInstalled)
+                    try
                     {
                         ManagedInstallerClass.InstallHelper(new string[] { exePath });
-                        Console.WriteLine("Service installed.");
+                        Console.WriteLine("Service installed successfully.");
+                        Console.WriteLine("Starting the service...");
+                        
+                        try
+                        {
+                            using (ServiceController sc = new ServiceController("NexusAgent"))
+                            {
+                                sc.Start();
+                                sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                                Console.WriteLine("Service started successfully.");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Error starting service: " + ex.Message);
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        Console.WriteLine("NEXUS Agent is already installed.");
+                        Console.WriteLine("Error installing service: " + ex.Message);
                     }
+                    
+                    Console.WriteLine("\nPress any key to exit...");
+                    Console.ReadKey();
+                    return;
+                }
+                else if (command == "/uninstall" || command == "-uninstall" || command == "--uninstall")
+                {
+                    Console.WriteLine("Uninstalling NEXUS Agent service...");
+                    try
+                    {
+                        // Stop the service first if running
+                        try
+                        {
+                            using (ServiceController sc = new ServiceController("NexusAgent"))
+                            {
+                                if (sc.Status == ServiceControllerStatus.Running)
+                                {
+                                    Console.WriteLine("Stopping service...");
+                                    sc.Stop();
+                                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                                }
+                            }
+                        }
+                        catch { }
+                        
+                        ManagedInstallerClass.InstallHelper(new string[] { "/u", exePath });
+                        Console.WriteLine("Service uninstalled successfully.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Error uninstalling service: " + ex.Message);
+                    }
+                    
+                    Console.WriteLine("\nPress any key to exit...");
+                    Console.ReadKey();
+                    return;
+                }
+            }
 
-                    // Start the service
+            // Check if already installed
+            bool serviceExists = false;
+            try
+            {
+                using (ServiceController sc = new ServiceController("NexusAgent"))
+                {
+                    var status = sc.Status;
+                    serviceExists = true;
+                }
+            }
+            catch { }
+
+            if (!serviceExists)
+            {
+                // Not installed and no args - install automatically
+                Console.WriteLine("NEXUS Agent is not installed. Installing...");
+                try
+                {
+                    ManagedInstallerClass.InstallHelper(new string[] { exePath });
+                    Console.WriteLine("Service installed successfully.");
                     Console.WriteLine("Starting the service...");
+                    
+                    try
+                    {
+                        using (ServiceController sc = new ServiceController("NexusAgent"))
+                        {
+                            sc.Start();
+                            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                            Console.WriteLine("Service started successfully.");
+                            Console.WriteLine("\nThe NEXUS Agent is now running as a Windows service.");
+                            Console.WriteLine("You can close this window.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Error starting service: " + ex.Message);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Error installing service: " + ex.Message);
+                }
+                
+                Console.WriteLine("\nPress any key to exit...");
+                Console.ReadKey();
+            }
+            else
+            {
+                Console.WriteLine("NEXUS Agent is already installed.");
+                Console.WriteLine("Starting the service...");
+                try
+                {
                     using (ServiceController sc = new ServiceController("NexusAgent"))
                     {
                         if (sc.Status != ServiceControllerStatus.Running)
@@ -71,22 +140,16 @@ namespace NexusAgent
                             sc.Start();
                             sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
                         }
-                        Console.WriteLine("NEXUS Agent service is now running.");
+                        Console.WriteLine("Service is running.");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("Error: " + ex.Message);
+                    Console.WriteLine("Error starting service: " + ex.Message);
                 }
-
+                
                 Console.WriteLine("\nPress any key to exit...");
                 Console.ReadKey();
-            }
-            else
-            {
-                // Running as Windows Service
-                ServiceBase[] ServicesToRun = new ServiceBase[] { new NexusAgentService() };
-                ServiceBase.Run(ServicesToRun);
             }
         }
     }
