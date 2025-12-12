@@ -6,9 +6,10 @@ using System.Management.Automation;
 using System.Net.Http;
 using System.ServiceProcess;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace NexusAgent
 {
@@ -17,9 +18,8 @@ namespace NexusAgent
         private CancellationTokenSource _cancellationTokenSource;
         private Task _workerTask;
         private AgentConfig _config;
-        private readonly HttpClient _httpClient;
+        private HttpClient _httpClient;
         private string _agentId;
-        private bool _isRunning;
 
         public NexusAgentService()
         {
@@ -35,22 +35,36 @@ namespace NexusAgent
 
         protected override void OnStop()
         {
-            _cancellationTokenSource?.Cancel();
-            _workerTask?.Wait(TimeSpan.FromSeconds(30));
+            if (_cancellationTokenSource != null)
+            {
+                _cancellationTokenSource.Cancel();
+            }
+            if (_workerTask != null)
+            {
+                _workerTask.Wait(TimeSpan.FromSeconds(30));
+            }
         }
 
         public void StartConsoleMode()
         {
-            _isRunning = true;
             _cancellationTokenSource = new CancellationTokenSource();
             _workerTask = RunAgentAsync(_cancellationTokenSource.Token);
         }
 
         public void StopConsoleMode()
         {
-            _isRunning = false;
-            _cancellationTokenSource?.Cancel();
-            try { _workerTask?.Wait(TimeSpan.FromSeconds(10)); } catch { }
+            if (_cancellationTokenSource != null)
+            {
+                _cancellationTokenSource.Cancel();
+            }
+            try 
+            { 
+                if (_workerTask != null)
+                {
+                    _workerTask.Wait(TimeSpan.FromSeconds(10)); 
+                }
+            } 
+            catch { }
         }
 
         private async Task RunAgentAsync(CancellationToken cancellationToken)
@@ -66,11 +80,11 @@ namespace NexusAgent
                     return;
                 }
 
-                LogMessage("Configuration loaded for deployment: " + _config.DeploymentId);
+                LogMessage("Configuration loaded for deployment: " + _config.deployment_id);
 
                 _httpClient.DefaultRequestHeaders.Clear();
-                _httpClient.DefaultRequestHeaders.Add("apikey", _config.SupabaseKey);
-                _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer " + _config.SupabaseKey);
+                _httpClient.DefaultRequestHeaders.Add("apikey", _config.supabase_key);
+                _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer " + _config.supabase_key);
 
                 _agentId = await RegisterAgentAsync();
                 if (string.IsNullOrEmpty(_agentId))
@@ -93,17 +107,22 @@ namespace NexusAgent
                         LogMessage("Error in main loop: " + ex.Message);
                     }
 
-                    await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                LogMessage("Agent stopping...");
             }
             catch (Exception ex)
             {
                 LogMessage("Fatal error: " + ex.Message);
             }
+            
+            LogMessage("Agent stopped.");
         }
 
         private AgentConfig ExtractConfig()
@@ -121,10 +140,11 @@ namespace NexusAgent
                 byte[] fileBytes = File.ReadAllBytes(exePath);
                 string fileContent = Encoding.UTF8.GetString(fileBytes);
 
+                // Look for JSON config pattern
                 int startIndex = -1;
                 for (int i = 0; i < fileBytes.Length - 20; i++)
                 {
-                    if (fileBytes[i] == '{' && fileBytes[i + 1] == '"' && fileBytes[i + 2] == 's')
+                    if (fileBytes[i] == (byte)'{' && fileBytes[i + 1] == (byte)'"' && fileBytes[i + 2] == (byte)'s')
                     {
                         string testStr = Encoding.UTF8.GetString(fileBytes, i, Math.Min(50, fileBytes.Length - i));
                         if (testStr.StartsWith("{\"supabase_url\":"))
@@ -148,12 +168,13 @@ namespace NexusAgent
                     return null;
                 }
 
+                // Find end of JSON
                 int endIndex = startIndex;
                 int braceCount = 0;
                 for (int i = startIndex; i < fileBytes.Length; i++)
                 {
-                    if (fileBytes[i] == '{') braceCount++;
-                    if (fileBytes[i] == '}') braceCount--;
+                    if (fileBytes[i] == (byte)'{') braceCount++;
+                    if (fileBytes[i] == (byte)'}') braceCount--;
                     if (braceCount == 0)
                     {
                         endIndex = i + 1;
@@ -162,9 +183,9 @@ namespace NexusAgent
                 }
 
                 string jsonStr = Encoding.UTF8.GetString(fileBytes, startIndex, endIndex - startIndex);
-                LogMessage("Found config JSON: " + jsonStr.Substring(0, Math.Min(100, jsonStr.Length)) + "...");
+                LogMessage("Found config, length: " + jsonStr.Length);
 
-                var config = JsonSerializer.Deserialize<AgentConfig>(jsonStr);
+                AgentConfig config = JsonConvert.DeserializeObject<AgentConfig>(jsonStr);
                 return config;
             }
             catch (Exception ex)
@@ -179,38 +200,37 @@ namespace NexusAgent
             try
             {
                 string hostname = Environment.MachineName;
-                string baseUrl = _config.SupabaseUrl.TrimEnd('/');
+                string baseUrl = _config.supabase_url.TrimEnd('/');
 
-                string selectUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.SecretKey + "&select=id";
+                // Find existing registration by secret key
+                string selectUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.secret_key + "&select=id";
                 
-                var response = await _httpClient.GetAsync(selectUrl);
-                var content = await response.Content.ReadAsStringAsync();
+                HttpResponseMessage response = await _httpClient.GetAsync(selectUrl);
+                string content = await response.Content.ReadAsStringAsync();
 
                 if (response.IsSuccessStatusCode && content != "[]")
                 {
-                    var records = JsonSerializer.Deserialize<List<AgentRecord>>(content);
+                    List<AgentRecord> records = JsonConvert.DeserializeObject<List<AgentRecord>>(content);
                     if (records != null && records.Count > 0)
                     {
-                        string updateUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.SecretKey;
-                        var updateData = new Dictionary<string, object>
-                        {
-                            { "hostname", hostname },
-                            { "status", "connected" },
-                            { "last_heartbeat", DateTime.UtcNow.ToString("o") },
-                            { "agent_version", "1.0.0" },
-                            { "is_active", true }
-                        };
+                        // Update existing record
+                        string updateUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.secret_key;
+                        
+                        var updateData = new Dictionary<string, object>();
+                        updateData["hostname"] = hostname;
+                        updateData["status"] = "connected";
+                        updateData["last_heartbeat"] = DateTime.UtcNow.ToString("o");
+                        updateData["agent_version"] = "1.0.0";
+                        updateData["is_active"] = true;
 
-                        var updateContent = new StringContent(
-                            JsonSerializer.Serialize(updateData),
+                        StringContent updateContent = new StringContent(
+                            JsonConvert.SerializeObject(updateData),
                             Encoding.UTF8,
                             "application/json"
                         );
 
-                        var request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl)
-                        {
-                            Content = updateContent
-                        };
+                        HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl);
+                        request.Content = updateContent;
 
                         await _httpClient.SendAsync(request);
                         LogMessage("Updated existing agent registration for " + hostname);
@@ -232,28 +252,24 @@ namespace NexusAgent
         {
             try
             {
-                string baseUrl = _config.SupabaseUrl.TrimEnd('/');
-                string updateUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.SecretKey;
+                string baseUrl = _config.supabase_url.TrimEnd('/');
+                string updateUrl = baseUrl + "/rest/v1/agent_installations?agent_key=eq." + _config.secret_key;
 
-                var updateData = new Dictionary<string, object>
-                {
-                    { "last_heartbeat", DateTime.UtcNow.ToString("o") },
-                    { "status", "connected" },
-                    { "hostname", Environment.MachineName }
-                };
+                var updateData = new Dictionary<string, object>();
+                updateData["last_heartbeat"] = DateTime.UtcNow.ToString("o");
+                updateData["status"] = "connected";
+                updateData["hostname"] = Environment.MachineName;
 
-                var content = new StringContent(
-                    JsonSerializer.Serialize(updateData),
+                StringContent content = new StringContent(
+                    JsonConvert.SerializeObject(updateData),
                     Encoding.UTF8,
                     "application/json"
                 );
 
-                var request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl)
-                {
-                    Content = content
-                };
+                HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl);
+                request.Content = content;
 
-                var response = await _httpClient.SendAsync(request);
+                HttpResponseMessage response = await _httpClient.SendAsync(request);
                 
                 if (response.IsSuccessStatusCode)
                 {
@@ -261,7 +277,7 @@ namespace NexusAgent
                 }
                 else
                 {
-                    var errorContent = await response.Content.ReadAsStringAsync();
+                    string errorContent = await response.Content.ReadAsStringAsync();
                     LogMessage("Heartbeat failed: " + response.StatusCode + " - " + errorContent);
                 }
             }
@@ -277,20 +293,20 @@ namespace NexusAgent
             {
                 if (string.IsNullOrEmpty(_agentId)) return;
 
-                string baseUrl = _config.SupabaseUrl.TrimEnd('/');
+                string baseUrl = _config.supabase_url.TrimEnd('/');
                 string selectUrl = baseUrl + "/rest/v1/agent_commands?agent_id=eq." + _agentId + "&status=eq.pending&select=*";
 
-                var response = await _httpClient.GetAsync(selectUrl);
+                HttpResponseMessage response = await _httpClient.GetAsync(selectUrl);
                 if (!response.IsSuccessStatusCode) return;
 
-                var content = await response.Content.ReadAsStringAsync();
-                var commands = JsonSerializer.Deserialize<List<AgentCommand>>(content);
+                string content = await response.Content.ReadAsStringAsync();
+                List<AgentCommand> commands = JsonConvert.DeserializeObject<List<AgentCommand>>(content);
 
                 if (commands == null || commands.Count == 0) return;
 
                 LogMessage("Found " + commands.Count + " pending command(s)");
 
-                foreach (var command in commands)
+                foreach (AgentCommand command in commands)
                 {
                     await ExecuteCommandAsync(command);
                 }
@@ -318,16 +334,16 @@ namespace NexusAgent
 
                     var results = ps.Invoke();
 
-                    var outputBuilder = new StringBuilder();
+                    StringBuilder outputBuilder = new StringBuilder();
                     foreach (var item in results)
                     {
-                        outputBuilder.AppendLine(item?.ToString() ?? "");
+                        outputBuilder.AppendLine(item != null ? item.ToString() : "");
                     }
                     output = outputBuilder.ToString();
 
                     if (ps.HadErrors)
                     {
-                        var errorBuilder = new StringBuilder();
+                        StringBuilder errorBuilder = new StringBuilder();
                         foreach (var err in ps.Streams.Error)
                         {
                             errorBuilder.AppendLine(err.ToString());
@@ -351,13 +367,11 @@ namespace NexusAgent
         {
             try
             {
-                string baseUrl = _config.SupabaseUrl.TrimEnd('/');
+                string baseUrl = _config.supabase_url.TrimEnd('/');
                 string updateUrl = baseUrl + "/rest/v1/agent_commands?id=eq." + commandId;
 
-                var updateData = new Dictionary<string, object>
-                {
-                    { "status", status }
-                };
+                var updateData = new Dictionary<string, object>();
+                updateData["status"] = status;
 
                 if (output != null) updateData["output"] = output;
                 if (error != null) updateData["error"] = error;
@@ -371,16 +385,14 @@ namespace NexusAgent
                     updateData["completed_at"] = DateTime.UtcNow.ToString("o");
                 }
 
-                var content = new StringContent(
-                    JsonSerializer.Serialize(updateData),
+                StringContent content = new StringContent(
+                    JsonConvert.SerializeObject(updateData),
                     Encoding.UTF8,
                     "application/json"
                 );
 
-                var request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl)
-                {
-                    Content = content
-                };
+                HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("PATCH"), updateUrl);
+                request.Content = content;
 
                 await _httpClient.SendAsync(request);
             }
@@ -400,7 +412,8 @@ namespace NexusAgent
                 Directory.CreateDirectory(logDir);
                 string logFile = Path.Combine(logDir, "agent.log");
                 
-                if (File.Exists(logFile) && new FileInfo(logFile).Length > 10 * 1024 * 1024)
+                FileInfo fi = new FileInfo(logFile);
+                if (fi.Exists && fi.Length > 10 * 1024 * 1024)
                 {
                     File.Delete(logFile);
                 }
@@ -422,11 +435,6 @@ namespace NexusAgent
         public string supabase_key { get; set; }
         public string deployment_id { get; set; }
         public string secret_key { get; set; }
-
-        public string SupabaseUrl { get { return supabase_url; } }
-        public string SupabaseKey { get { return supabase_key; } }
-        public string DeploymentId { get { return deployment_id; } }
-        public string SecretKey { get { return secret_key; } }
     }
 
     public class AgentRecord
