@@ -1,6 +1,5 @@
 using System;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.ServiceProcess;
 
@@ -14,12 +13,6 @@ namespace NexusAgent
 
         public static void Main(string[] args)
         {
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                Console.WriteLine("This application only runs on Windows.");
-                return;
-            }
-
             // Check for command line arguments
             if (args.Length > 0)
             {
@@ -37,7 +30,6 @@ namespace NexusAgent
                 }
                 else if (command == "--console" || command == "-c")
                 {
-                    // Run in console mode for debugging
                     RunConsoleMode();
                     return;
                 }
@@ -46,7 +38,6 @@ namespace NexusAgent
             // If running interactively (double-clicked), install the service
             if (Environment.UserInteractive)
             {
-                // Check if already installed
                 if (IsServiceInstalled())
                 {
                     Console.WriteLine("NEXUS Agent is already installed.");
@@ -57,10 +48,8 @@ namespace NexusAgent
                     return;
                 }
 
-                // Need to install - check for admin rights
                 if (!IsAdministrator())
                 {
-                    // Relaunch with admin rights
                     RelaunchAsAdmin("--install");
                     return;
                 }
@@ -86,10 +75,10 @@ namespace NexusAgent
         {
             ProcessStartInfo startInfo = new ProcessStartInfo
             {
-                FileName = Process.GetCurrentProcess().MainModule?.FileName ?? "NexusAgent.exe",
+                FileName = Process.GetCurrentProcess().MainModule.FileName,
                 Arguments = arguments,
                 UseShellExecute = true,
-                Verb = "runas" // This triggers UAC prompt
+                Verb = "runas"
             };
 
             try
@@ -122,9 +111,9 @@ namespace NexusAgent
 
         private static void InstallService()
         {
-            Console.WriteLine("╔════════════════════════════════════════╗");
-            Console.WriteLine("║       NEXUS Agent Installer            ║");
-            Console.WriteLine("╚════════════════════════════════════════╝");
+            Console.WriteLine("========================================");
+            Console.WriteLine("       NEXUS Agent Installer            ");
+            Console.WriteLine("========================================");
             Console.WriteLine();
 
             if (!IsAdministrator())
@@ -136,7 +125,7 @@ namespace NexusAgent
                 return;
             }
 
-            string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            string exePath = Process.GetCurrentProcess().MainModule.FileName;
             
             if (string.IsNullOrEmpty(exePath))
             {
@@ -150,18 +139,17 @@ namespace NexusAgent
             {
                 Console.WriteLine("Installing NEXUS Agent service...");
                 
-                // Create the service using sc.exe
                 ProcessStartInfo scCreate = new ProcessStartInfo
                 {
                     FileName = "sc.exe",
-                    Arguments = $"create \"{ServiceName}\" binPath= \"\\\"{exePath}\\\"\" start= auto DisplayName= \"{ServiceDisplayName}\"",
+                    Arguments = string.Format("create \"{0}\" binPath= \"\\\"{1}\\\"\" start= auto DisplayName= \"{2}\"", ServiceName, exePath, ServiceDisplayName),
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     CreateNoWindow = true
                 };
 
-                using (Process process = Process.Start(scCreate)!)
+                using (Process process = Process.Start(scCreate))
                 {
                     process.WaitForExit();
                     string output = process.StandardOutput.ReadToEnd();
@@ -169,49 +157,46 @@ namespace NexusAgent
 
                     if (process.ExitCode != 0 && !output.Contains("exists"))
                     {
-                        Console.WriteLine($"Warning: {error}");
+                        Console.WriteLine("Warning: " + error);
                     }
                 }
 
-                // Set service description
                 ProcessStartInfo scDesc = new ProcessStartInfo
                 {
                     FileName = "sc.exe",
-                    Arguments = $"description \"{ServiceName}\" \"{ServiceDescription}\"",
+                    Arguments = string.Format("description \"{0}\" \"{1}\"", ServiceName, ServiceDescription),
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
-                Process.Start(scDesc)?.WaitForExit();
+                Process.Start(scDesc).WaitForExit();
 
-                // Configure service recovery (restart on failure)
                 ProcessStartInfo scFailure = new ProcessStartInfo
                 {
                     FileName = "sc.exe",
-                    Arguments = $"failure \"{ServiceName}\" reset= 86400 actions= restart/60000/restart/60000/restart/60000",
+                    Arguments = string.Format("failure \"{0}\" reset= 86400 actions= restart/60000/restart/60000/restart/60000", ServiceName),
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
-                Process.Start(scFailure)?.WaitForExit();
+                Process.Start(scFailure).WaitForExit();
 
-                Console.WriteLine("✓ Service installed successfully!");
+                Console.WriteLine("[OK] Service installed successfully!");
                 Console.WriteLine();
 
-                // Start the service
                 Console.WriteLine("Starting NEXUS Agent service...");
                 StartService();
                 
                 Console.WriteLine();
-                Console.WriteLine("╔════════════════════════════════════════╗");
-                Console.WriteLine("║    Installation Complete!              ║");
-                Console.WriteLine("║                                        ║");
-                Console.WriteLine("║    The NEXUS Agent is now running      ║");
-                Console.WriteLine("║    and will start automatically        ║");
-                Console.WriteLine("║    when Windows starts.                ║");
-                Console.WriteLine("╚════════════════════════════════════════╝");
+                Console.WriteLine("========================================");
+                Console.WriteLine("    Installation Complete!              ");
+                Console.WriteLine("                                        ");
+                Console.WriteLine("    The NEXUS Agent is now running      ");
+                Console.WriteLine("    and will start automatically        ");
+                Console.WriteLine("    when Windows starts.                ");
+                Console.WriteLine("========================================");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error installing service: {ex.Message}");
+                Console.WriteLine("Error installing service: " + ex.Message);
             }
 
             Console.WriteLine("\nPress any key to exit...");
@@ -220,9 +205,9 @@ namespace NexusAgent
 
         private static void UninstallService()
         {
-            Console.WriteLine("╔════════════════════════════════════════╗");
-            Console.WriteLine("║       NEXUS Agent Uninstaller          ║");
-            Console.WriteLine("╚════════════════════════════════════════╝");
+            Console.WriteLine("========================================");
+            Console.WriteLine("       NEXUS Agent Uninstaller          ");
+            Console.WriteLine("========================================");
             Console.WriteLine();
 
             if (!IsAdministrator())
@@ -233,7 +218,6 @@ namespace NexusAgent
 
             try
             {
-                // Stop the service first
                 Console.WriteLine("Stopping NEXUS Agent service...");
                 try
                 {
@@ -245,38 +229,37 @@ namespace NexusAgent
                             sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
                         }
                     }
-                    Console.WriteLine("✓ Service stopped.");
+                    Console.WriteLine("[OK] Service stopped.");
                 }
                 catch
                 {
                     Console.WriteLine("Service was not running.");
                 }
 
-                // Delete the service
                 Console.WriteLine("Removing NEXUS Agent service...");
                 ProcessStartInfo scDelete = new ProcessStartInfo
                 {
                     FileName = "sc.exe",
-                    Arguments = $"delete \"{ServiceName}\"",
+                    Arguments = string.Format("delete \"{0}\"", ServiceName),
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     CreateNoWindow = true
                 };
 
-                using (Process process = Process.Start(scDelete)!)
+                using (Process process = Process.Start(scDelete))
                 {
                     process.WaitForExit();
                 }
 
-                Console.WriteLine("✓ Service removed successfully!");
+                Console.WriteLine("[OK] Service removed successfully!");
                 Console.WriteLine();
-                Console.WriteLine("╔════════════════════════════════════════╗");
-                Console.WriteLine("║    Uninstallation Complete!            ║");
-                Console.WriteLine("╚════════════════════════════════════════╝");
+                Console.WriteLine("========================================");
+                Console.WriteLine("    Uninstallation Complete!            ");
+                Console.WriteLine("========================================");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error uninstalling service: {ex.Message}");
+                Console.WriteLine("Error uninstalling service: " + ex.Message);
             }
 
             Console.WriteLine("\nPress any key to exit...");
@@ -294,12 +277,12 @@ namespace NexusAgent
                         sc.Start();
                         sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
                     }
-                    Console.WriteLine("✓ Service started successfully!");
+                    Console.WriteLine("[OK] Service started successfully!");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error starting service: {ex.Message}");
+                Console.WriteLine("Error starting service: " + ex.Message);
             }
         }
 
@@ -311,16 +294,17 @@ namespace NexusAgent
             var service = new NexusAgentService();
             service.StartConsoleMode();
             
-            // Keep running until Ctrl+C
-            var exitEvent = new System.Threading.ManualResetEvent(false);
             Console.CancelKeyPress += (sender, e) =>
             {
                 e.Cancel = true;
-                exitEvent.Set();
+                service.StopConsoleMode();
+                Environment.Exit(0);
             };
-            exitEvent.WaitOne();
-            
-            service.StopConsoleMode();
+
+            while (true)
+            {
+                System.Threading.Thread.Sleep(1000);
+            }
         }
     }
 }
