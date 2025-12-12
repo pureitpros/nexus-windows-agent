@@ -5,13 +5,13 @@ using System.ServiceProcess;
 
 namespace NexusAgent
 {
-    public class Program
+    static class Program
     {
         public const string ServiceName = "NEXUS Agent";
         public const string ServiceDisplayName = "NEXUS Agent";
         public const string ServiceDescription = "NEXUS Windows Agent for Active Directory integration and PowerShell command execution.";
 
-        public static void Main(string[] args)
+        static void Main(string[] args)
         {
             if (args.Length > 0)
             {
@@ -41,7 +41,8 @@ namespace NexusAgent
                     Console.WriteLine("NEXUS Agent is already installed.");
                     Console.WriteLine("Starting the service...");
                     StartService();
-                    Console.WriteLine("\nPress any key to exit...");
+                    Console.WriteLine();
+                    Console.WriteLine("Press any key to exit...");
                     Console.ReadKey();
                     return;
                 }
@@ -56,7 +57,8 @@ namespace NexusAgent
                 return;
             }
 
-            ServiceBase.Run(new NexusAgentService());
+            ServiceBase[] servicesToRun = new ServiceBase[] { new NexusAgentService() };
+            ServiceBase.Run(servicesToRun);
         }
 
         private static bool IsAdministrator()
@@ -69,7 +71,7 @@ namespace NexusAgent
         private static void RelaunchAsAdmin(string arguments)
         {
             ProcessStartInfo startInfo = new ProcessStartInfo();
-            startInfo.FileName = Process.GetCurrentProcess().MainModule.FileName;
+            startInfo.FileName = System.Reflection.Assembly.GetExecutingAssembly().Location;
             startInfo.Arguments = arguments;
             startInfo.UseShellExecute = true;
             startInfo.Verb = "runas";
@@ -88,15 +90,23 @@ namespace NexusAgent
 
         private static bool IsServiceInstalled()
         {
+            ServiceController sc = null;
             try
             {
-                ServiceController sc = new ServiceController(ServiceName);
-                var status = sc.Status;
+                sc = new ServiceController(ServiceName);
+                ServiceControllerStatus status = sc.Status;
                 return true;
             }
             catch
             {
                 return false;
+            }
+            finally
+            {
+                if (sc != null)
+                {
+                    sc.Dispose();
+                }
             }
         }
 
@@ -111,17 +121,19 @@ namespace NexusAgent
             {
                 Console.WriteLine("Error: Administrator privileges required.");
                 Console.WriteLine("Please run as Administrator.");
-                Console.WriteLine("\nPress any key to exit...");
+                Console.WriteLine();
+                Console.WriteLine("Press any key to exit...");
                 Console.ReadKey();
                 return;
             }
 
-            string exePath = Process.GetCurrentProcess().MainModule.FileName;
+            string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
             
             if (string.IsNullOrEmpty(exePath))
             {
                 Console.WriteLine("Error: Could not determine executable path.");
-                Console.WriteLine("\nPress any key to exit...");
+                Console.WriteLine();
+                Console.WriteLine("Press any key to exit...");
                 Console.ReadKey();
                 return;
             }
@@ -153,14 +165,16 @@ namespace NexusAgent
                 scDesc.Arguments = string.Format("description \"{0}\" \"{1}\"", ServiceName, ServiceDescription);
                 scDesc.UseShellExecute = false;
                 scDesc.CreateNoWindow = true;
-                Process.Start(scDesc).WaitForExit();
+                Process descProcess = Process.Start(scDesc);
+                descProcess.WaitForExit();
 
                 ProcessStartInfo scFailure = new ProcessStartInfo();
                 scFailure.FileName = "sc.exe";
                 scFailure.Arguments = string.Format("failure \"{0}\" reset= 86400 actions= restart/60000/restart/60000/restart/60000", ServiceName);
                 scFailure.UseShellExecute = false;
                 scFailure.CreateNoWindow = true;
-                Process.Start(scFailure).WaitForExit();
+                Process failProcess = Process.Start(scFailure);
+                failProcess.WaitForExit();
 
                 Console.WriteLine("[OK] Service installed successfully!");
                 Console.WriteLine();
@@ -182,7 +196,8 @@ namespace NexusAgent
                 Console.WriteLine("Error installing service: " + ex.Message);
             }
 
-            Console.WriteLine("\nPress any key to exit...");
+            Console.WriteLine();
+            Console.WriteLine("Press any key to exit...");
             Console.ReadKey();
         }
 
@@ -202,9 +217,10 @@ namespace NexusAgent
             try
             {
                 Console.WriteLine("Stopping NEXUS Agent service...");
+                ServiceController sc = null;
                 try
                 {
-                    ServiceController sc = new ServiceController(ServiceName);
+                    sc = new ServiceController(ServiceName);
                     if (sc.Status != ServiceControllerStatus.Stopped)
                     {
                         sc.Stop();
@@ -215,6 +231,13 @@ namespace NexusAgent
                 catch
                 {
                     Console.WriteLine("Service was not running.");
+                }
+                finally
+                {
+                    if (sc != null)
+                    {
+                        sc.Dispose();
+                    }
                 }
 
                 Console.WriteLine("Removing NEXUS Agent service...");
@@ -239,15 +262,17 @@ namespace NexusAgent
                 Console.WriteLine("Error uninstalling service: " + ex.Message);
             }
 
-            Console.WriteLine("\nPress any key to exit...");
+            Console.WriteLine();
+            Console.WriteLine("Press any key to exit...");
             Console.ReadKey();
         }
 
         private static void StartService()
         {
+            ServiceController sc = null;
             try
             {
-                ServiceController sc = new ServiceController(ServiceName);
+                sc = new ServiceController(ServiceName);
                 if (sc.Status != ServiceControllerStatus.Running)
                 {
                     sc.Start();
@@ -259,6 +284,13 @@ namespace NexusAgent
             {
                 Console.WriteLine("Error starting service: " + ex.Message);
             }
+            finally
+            {
+                if (sc != null)
+                {
+                    sc.Dispose();
+                }
+            }
         }
 
         private static void RunConsoleMode()
@@ -269,12 +301,6 @@ namespace NexusAgent
             NexusAgentService service = new NexusAgentService();
             service.StartConsoleMode();
             
-            Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e) {
-                e.Cancel = true;
-                service.StopConsoleMode();
-                Environment.Exit(0);
-            };
-
             while (true)
             {
                 System.Threading.Thread.Sleep(1000);
