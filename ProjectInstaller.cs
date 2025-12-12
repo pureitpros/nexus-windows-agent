@@ -13,15 +13,12 @@ namespace NexusAgent
         public ProjectInstaller()
         {
             processInstaller = new ServiceProcessInstaller();
-            serviceInstaller = new ServiceInstaller();
-
-            // Run as Local System account
             processInstaller.Account = ServiceAccount.LocalSystem;
 
-            // Service configuration
+            serviceInstaller = new ServiceInstaller();
             serviceInstaller.ServiceName = "NexusAgent";
             serviceInstaller.DisplayName = "NEXUS Agent";
-            serviceInstaller.Description = "NEXUS on-premises agent for Active Directory integration";
+            serviceInstaller.Description = "NEXUS Windows Agent for Active Directory integration and PowerShell execution";
             serviceInstaller.StartType = ServiceStartMode.Automatic;
 
             Installers.Add(processInstaller);
