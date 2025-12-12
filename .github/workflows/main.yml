@@ -2,60 +2,76 @@ name: Build NEXUS Agent
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
-    
+
     - name: Setup NuGet
-      uses: NuGet/setup-nuget@v1
-      
+      uses: NuGet/setup-nuget@v2
+
     - name: Restore NuGet packages
       run: nuget restore NexusAgent.csproj -PackagesDirectory packages
-    
+
+    - name: Create placeholder in source
+      shell: powershell
+      run: |
+        # Add placeholder constant that will be replaced at download time
+        Write-Host "Placeholder will be appended during download from NEXUS"
+
     - name: Build
       run: msbuild NexusAgent.csproj /p:Configuration=Release /p:Platform="Any CPU" /p:OutputPath=bin\Release\
-      
-    - name: Create template.exe with placeholder
+
+    - name: List output files
+      shell: powershell
+      run: |
+        Write-Host "Contents of bin\Release:"
+        Get-ChildItem -Path bin\Release\ -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+    - name: Append placeholder to executable
       shell: powershell
       run: |
         $exePath = "bin\Release\NexusAgent.exe"
-        if (!(Test-Path $exePath)) {
-          Write-Error "Build output not found at: $exePath"
-          Get-ChildItem -Recurse -Filter "*.exe" | ForEach-Object { Write-Host $_.FullName }
+        if (Test-Path $exePath) {
+          # Create a 500-byte placeholder that will be replaced by the edge function
+          $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
+          $paddedPlaceholder = $placeholder.PadRight(500, [char]0)
+          $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($paddedPlaceholder)
+          
+          # Append to executable
+          [System.IO.File]::AppendAllBytes($exePath, $placeholderBytes)
+          
+          $fileInfo = Get-Item $exePath
+          Write-Host "Final executable size: $($fileInfo.Length) bytes"
+          Write-Host "Placeholder appended successfully"
+        } else {
+          Write-Host "ERROR: NexusAgent.exe not found at $exePath"
           exit 1
         }
-        
-        # Read the compiled executable
-        $exeBytes = [System.IO.File]::ReadAllBytes($exePath)
-        
-        # Create placeholder (500 bytes padded with spaces)
-        $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
-        $paddedPlaceholder = $placeholder.PadRight(500, ' ')
-        $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($paddedPlaceholder)
-        
-        # Append placeholder to the end of the executable
-        $templateBytes = $exeBytes + $placeholderBytes
-        
-        # Write template.exe
-        $templatePath = "bin\Release\template.exe"
-        [System.IO.File]::WriteAllBytes($templatePath, $templateBytes)
-        
-        Write-Host "Created template.exe ($(([System.IO.FileInfo]$templatePath).Length) bytes)"
-        Write-Host "Placeholder appended at offset: $($exeBytes.Length)"
-    
+
+    - name: Rename to template.exe
+      shell: powershell
+      run: |
+        $sourcePath = "bin\Release\NexusAgent.exe"
+        $destPath = "bin\Release\template.exe"
+        if (Test-Path $sourcePath) {
+          Copy-Item $sourcePath $destPath
+          Write-Host "Renamed to template.exe"
+        }
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: nexus-agent-template
         path: bin\Release\template.exe
+        if-no-files-found: error
