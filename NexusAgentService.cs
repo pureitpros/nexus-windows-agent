@@ -1,289 +1,514 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Management.Automation;
 using System.Net.Http;
+using System.ServiceProcess;
 using System.Text;
 using System.Text.Json;
-using System.ServiceProcess;
-using System.Timers;
-using System.Management.Automation;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace NexusAgent
 {
-    public partial class NexusAgentService : ServiceBase
+    public class NexusAgentService : ServiceBase
     {
-        private Timer _pollTimer;
-        private Timer _heartbeatTimer;
-        private HttpClient _httpClient;
-        private AgentConfig _config;
+        private CancellationTokenSource? _cancellationTokenSource;
+        private Task? _workerTask;
+        private AgentConfig? _config;
+        private readonly HttpClient _httpClient;
+        private string? _agentId;
 
         public NexusAgentService()
         {
-            if (OperatingSystem.IsWindows())
-            {
-                ServiceName = "NEXUS Agent";
-                CanStop = true;
-                CanPauseAndContinue = false;
-                AutoLog = true;
-            }
+            ServiceName = Program.ServiceName;
+            _httpClient = new HttpClient();
+            _httpClient.DefaultRequestHeaders.Add("apikey", "");
+            _httpClient.DefaultRequestHeaders.Add("Authorization", "Bearer ");
         }
 
         protected override void OnStart(string[] args)
         {
-            try
-            {
-                LogEvent("Starting NEXUS Agent...");
-                _config = ExtractEmbeddedConfig();
-                LogEvent($"Connected to: {_config.deployment_id}");
-                
-                _httpClient = new HttpClient();
-                _httpClient.DefaultRequestHeaders.Add("apikey", _config.supabase_key);
-                _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_config.supabase_key}");
-
-                SendHeartbeat();
-
-                _pollTimer = new Timer(30000);
-                _pollTimer.Elapsed += PollForCommands;
-                _pollTimer.Start();
-
-                _heartbeatTimer = new Timer(300000);
-                _heartbeatTimer.Elapsed += (s, e) => SendHeartbeat();
-                _heartbeatTimer.Start();
-
-                LogEvent("NEXUS Agent started successfully");
-            }
-            catch (Exception ex)
-            {
-                LogEvent($"Failed to start: {ex.Message}");
-                throw;
-            }
+            _cancellationTokenSource = new CancellationTokenSource();
+            _workerTask = RunAgentAsync(_cancellationTokenSource.Token);
         }
 
         protected override void OnStop()
         {
-            _pollTimer?.Stop();
-            _heartbeatTimer?.Stop();
-            _httpClient?.Dispose();
-            LogEvent("NEXUS Agent stopped");
+            _cancellationTokenSource?.Cancel();
+            _workerTask?.Wait(TimeSpan.FromSeconds(30));
         }
 
-        private AgentConfig ExtractEmbeddedConfig()
+        // For console mode debugging
+        public void StartConsoleMode()
+        {
+            _cancellationTokenSource = new CancellationTokenSource();
+            _workerTask = RunAgentAsync(_cancellationTokenSource.Token);
+        }
+
+        public void StopConsoleMode()
+        {
+            _cancellationTokenSource?.Cancel();
+            _workerTask?.Wait(TimeSpan.FromSeconds(10));
+        }
+
+        private async Task RunAgentAsync(CancellationToken cancellationToken)
         {
             try
             {
-                string exePath = Environment.ProcessPath;
-                if (string.IsNullOrEmpty(exePath))
+                LogMessage("NEXUS Agent starting...");
+
+                // Extract embedded configuration
+                _config = ExtractConfig();
+                if (_config == null)
                 {
-                    throw new Exception("Cannot find executable path");
+                    LogMessage("ERROR: Failed to extract configuration. Agent cannot start.");
+                    return;
                 }
 
-                byte[] exeBytes = File.ReadAllBytes(exePath);
-                
-                string placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>";
-                byte[] placeholderBytes = Encoding.UTF8.GetBytes(placeholder);
-                
-                int index = FindPattern(exeBytes, placeholderBytes);
-                if (index == -1)
+                LogMessage($"Configuration loaded for deployment: {_config.DeploymentId}");
+
+                // Set up HTTP client with credentials
+                _httpClient.DefaultRequestHeaders.Remove("apikey");
+                _httpClient.DefaultRequestHeaders.Remove("Authorization");
+                _httpClient.DefaultRequestHeaders.Add("apikey", _config.SupabaseKey);
+                _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_config.SupabaseKey}");
+
+                // Register/update agent and get agent ID
+                _agentId = await RegisterAgentAsync();
+                if (string.IsNullOrEmpty(_agentId))
                 {
-                    throw new Exception("Config placeholder not found");
+                    LogMessage("ERROR: Failed to register agent.");
+                    return;
                 }
 
-                byte[] configBytes = new byte[500];
-                Array.Copy(exeBytes, index, configBytes, 0, 500);
-                
-                string configJson = Encoding.UTF8.GetString(configBytes).TrimEnd(' ', '\0');
-                var config = JsonSerializer.Deserialize<AgentConfig>(configJson);
-                
-                if (config == null)
+                LogMessage($"Agent registered with ID: {_agentId}");
+
+                // Main loop
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    throw new Exception("Failed to deserialize config");
+                    try
+                    {
+                        // Send heartbeat
+                        await SendHeartbeatAsync();
+
+                        // Poll for commands
+                        await PollAndExecuteCommandsAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"Error in main loop: {ex.Message}");
+                    }
+
+                    // Wait before next poll (30 seconds)
+                    await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                LogMessage("Agent stopping...");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Fatal error: {ex.Message}");
+            }
+        }
+
+        private AgentConfig? ExtractConfig()
+        {
+            try
+            {
+                string exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
                 
+                // For single-file published apps, use the process path
+                if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
+                {
+                    exePath = Environment.ProcessPath ?? "";
+                }
+
+                if (!File.Exists(exePath))
+                {
+                    LogMessage("Could not find executable path");
+                    return null;
+                }
+
+                byte[] fileBytes = File.ReadAllBytes(exePath);
+                string fileContent = Encoding.UTF8.GetString(fileBytes);
+
+                // Look for the JSON config that replaced the placeholder
+                string marker = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>";
+                
+                // The config should be JSON, look for the pattern
+                int startIndex = -1;
+                for (int i = 0; i < fileBytes.Length - 20; i++)
+                {
+                    // Look for {"supabase_url":
+                    if (fileBytes[i] == '{' && fileBytes[i + 1] == '"' && fileBytes[i + 2] == 's')
+                    {
+                        string testStr = Encoding.UTF8.GetString(fileBytes, i, Math.Min(50, fileBytes.Length - i));
+                        if (testStr.StartsWith("{\"supabase_url\":"))
+                        {
+                            startIndex = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (startIndex == -1)
+                {
+                    // Check if placeholder still exists (template not configured)
+                    if (fileContent.Contains(marker))
+                    {
+                        LogMessage("Agent has not been configured - placeholder still present");
+                    }
+                    else
+                    {
+                        LogMessage("Could not find configuration in executable");
+                    }
+                    return null;
+                }
+
+                // Find the end of the JSON (look for the closing brace followed by padding or nulls)
+                int endIndex = startIndex;
+                int braceCount = 0;
+                for (int i = startIndex; i < fileBytes.Length; i++)
+                {
+                    if (fileBytes[i] == '{') braceCount++;
+                    if (fileBytes[i] == '}') braceCount--;
+                    if (braceCount == 0)
+                    {
+                        endIndex = i + 1;
+                        break;
+                    }
+                }
+
+                string jsonStr = Encoding.UTF8.GetString(fileBytes, startIndex, endIndex - startIndex);
+                LogMessage($"Found config JSON: {jsonStr.Substring(0, Math.Min(100, jsonStr.Length))}...");
+
+                var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                var config = JsonSerializer.Deserialize<AgentConfig>(jsonStr, options);
+
                 return config;
             }
             catch (Exception ex)
             {
-                LogEvent($"Failed to extract config: {ex.Message}");
-                throw;
+                LogMessage($"Error extracting config: {ex.Message}");
+                return null;
             }
         }
 
-        private void PollForCommands(object sender, ElapsedEventArgs e)
+        private async Task<string?> RegisterAgentAsync()
         {
             try
             {
-                string url = $"{_config.supabase_url}/rest/v1/agent_commands?status=eq.pending&select=*";
-                var response = _httpClient.GetAsync(url).Result;
+                string hostname = Environment.MachineName;
+                string baseUrl = _config!.SupabaseUrl.TrimEnd('/');
+
+                // First, try to find existing registration by secret key
+                string selectUrl = $"{baseUrl}/rest/v1/agent_installations?agent_key=eq.{_config.SecretKey}&select=id";
                 
-                if (!response.IsSuccessStatusCode) return;
+                var response = await _httpClient.GetAsync(selectUrl);
+                var content = await response.Content.ReadAsStringAsync();
 
-                string json = response.Content.ReadAsStringAsync().Result;
-                var commands = JsonSerializer.Deserialize<AgentCommand[]>(json);
-
-                if (commands != null)
+                if (response.IsSuccessStatusCode && content != "[]")
                 {
-                    foreach (var command in commands)
+                    // Parse existing record
+                    var records = JsonSerializer.Deserialize<List<AgentRecord>>(content);
+                    if (records != null && records.Count > 0)
                     {
-                        ExecuteCommand(command);
+                        // Update existing record
+                        string updateUrl = $"{baseUrl}/rest/v1/agent_installations?agent_key=eq.{_config.SecretKey}";
+                        var updateData = new
+                        {
+                            hostname = hostname,
+                            status = "connected",
+                            last_heartbeat = DateTime.UtcNow.ToString("o"),
+                            agent_version = "1.0.0",
+                            is_active = true
+                        };
+
+                        var updateContent = new StringContent(
+                            JsonSerializer.Serialize(updateData),
+                            Encoding.UTF8,
+                            "application/json"
+                        );
+
+                        // Add Prefer header for upsert
+                        var request = new HttpRequestMessage(HttpMethod.Patch, updateUrl)
+                        {
+                            Content = updateContent
+                        };
+
+                        await _httpClient.SendAsync(request);
+                        LogMessage($"Updated existing agent registration for {hostname}");
+                        return records[0].Id;
                     }
                 }
+
+                // No existing record - this shouldn't happen as download-agent creates the record
+                // But just in case, log it
+                LogMessage("Warning: No existing agent registration found for this secret key");
+                return null;
             }
             catch (Exception ex)
             {
-                LogEvent($"Poll error: {ex.Message}");
+                LogMessage($"Error registering agent: {ex.Message}");
+                return null;
             }
         }
 
-        private void ExecuteCommand(AgentCommand command)
+        private async Task SendHeartbeatAsync()
         {
             try
             {
-                LogEvent($"Executing: {command.command_type}");
-                UpdateCommandStatus(command.id, "running", "", "");
+                string baseUrl = _config!.SupabaseUrl.TrimEnd('/');
+                string updateUrl = $"{baseUrl}/rest/v1/agent_installations?agent_key=eq.{_config.SecretKey}";
 
-                string output = "";
-                string error = "";
-
-                if (command.command_type == "powershell")
+                var updateData = new
                 {
-                    (output, error) = ExecutePowerShell(command.script ?? "");
+                    last_heartbeat = DateTime.UtcNow.ToString("o"),
+                    status = "connected",
+                    hostname = Environment.MachineName
+                };
+
+                var content = new StringContent(
+                    JsonSerializer.Serialize(updateData),
+                    Encoding.UTF8,
+                    "application/json"
+                );
+
+                var request = new HttpRequestMessage(HttpMethod.Patch, updateUrl)
+                {
+                    Content = content
+                };
+
+                var response = await _httpClient.SendAsync(request);
+                
+                if (response.IsSuccessStatusCode)
+                {
+                    LogMessage("Heartbeat sent successfully");
                 }
                 else
                 {
-                    error = $"Unknown command: {command.command_type}";
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    LogMessage($"Heartbeat failed: {response.StatusCode} - {errorContent}");
                 }
-
-                bool success = string.IsNullOrEmpty(error);
-                UpdateCommandStatus(command.id, success ? "completed" : "failed", output, error);
             }
             catch (Exception ex)
             {
-                UpdateCommandStatus(command.id, "failed", "", ex.Message);
+                LogMessage($"Error sending heartbeat: {ex.Message}");
             }
         }
 
-        private (string output, string error) ExecutePowerShell(string script)
+        private async Task PollAndExecuteCommandsAsync()
         {
+            try
+            {
+                if (string.IsNullOrEmpty(_agentId)) return;
+
+                string baseUrl = _config!.SupabaseUrl.TrimEnd('/');
+                string selectUrl = $"{baseUrl}/rest/v1/agent_commands?agent_id=eq.{_agentId}&status=eq.pending&select=*";
+
+                var response = await _httpClient.GetAsync(selectUrl);
+                if (!response.IsSuccessStatusCode) return;
+
+                var content = await response.Content.ReadAsStringAsync();
+                var commands = JsonSerializer.Deserialize<List<AgentCommand>>(content);
+
+                if (commands == null || commands.Count == 0) return;
+
+                LogMessage($"Found {commands.Count} pending command(s)");
+
+                foreach (var command in commands)
+                {
+                    await ExecuteCommandAsync(command);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error polling commands: {ex.Message}");
+            }
+        }
+
+        private async Task ExecuteCommandAsync(AgentCommand command)
+        {
+            LogMessage($"Executing command: {command.CommandType}");
+            
+            // Update status to running
+            await UpdateCommandStatusAsync(command.Id, "running", null, null);
+
+            string? output = null;
+            string? error = null;
+            object? result = null;
+
             try
             {
                 using (PowerShell ps = PowerShell.Create())
                 {
-                    ps.AddScript(script);
-                    var results = ps.Invoke();
-                    
-                    var output = new StringBuilder();
-                    foreach (var result in results)
+                    ps.AddScript(command.Script);
+
+                    var results = await Task.Run(() => ps.Invoke());
+
+                    var outputBuilder = new StringBuilder();
+                    foreach (var item in results)
                     {
-                        output.AppendLine(result?.ToString() ?? "");
+                        outputBuilder.AppendLine(item?.ToString() ?? "");
+                    }
+                    output = outputBuilder.ToString();
+
+                    if (ps.HadErrors)
+                    {
+                        var errorBuilder = new StringBuilder();
+                        foreach (var err in ps.Streams.Error)
+                        {
+                            errorBuilder.AppendLine(err.ToString());
+                        }
+                        error = errorBuilder.ToString();
                     }
 
-                    var errors = new StringBuilder();
-                    foreach (var error in ps.Streams.Error)
+                    // Try to serialize results
+                    if (results.Count > 0)
                     {
-                        errors.AppendLine(error.ToString());
+                        try
+                        {
+                            result = results.Count == 1 
+                                ? results[0]?.BaseObject 
+                                : results.Select(r => r?.BaseObject).ToList();
+                        }
+                        catch
+                        {
+                            result = output;
+                        }
                     }
-
-                    return (output.ToString(), errors.ToString());
                 }
+
+                await UpdateCommandStatusAsync(command.Id, "completed", output, error, result);
+                LogMessage($"Command completed: {command.CommandType}");
             }
             catch (Exception ex)
             {
-                return ("", ex.Message);
+                error = ex.Message;
+                await UpdateCommandStatusAsync(command.Id, "failed", output, error);
+                LogMessage($"Command failed: {ex.Message}");
             }
         }
 
-        private void UpdateCommandStatus(string commandId, string status, string output, string error)
+        private async Task UpdateCommandStatusAsync(string commandId, string status, string? output, string? error, object? result = null)
         {
             try
             {
-                var update = new
+                string baseUrl = _config!.SupabaseUrl.TrimEnd('/');
+                string updateUrl = $"{baseUrl}/rest/v1/agent_commands?id=eq.{commandId}";
+
+                var updateData = new Dictionary<string, object?>
                 {
-                    status = status,
-                    output = output,
-                    error = error,
-                    executed_at = DateTime.UtcNow.ToString("o")
+                    { "status", status },
+                    { "output", output },
+                    { "error", error }
                 };
 
-                string json = JsonSerializer.Serialize(update);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                string url = $"{_config.supabase_url}/rest/v1/agent_commands?id=eq.{commandId}";
-                _httpClient.PatchAsync(url, content).Wait();
-            }
-            catch { }
-        }
-
-        private void SendHeartbeat()
-        {
-            try
-            {
-                var heartbeat = new
+                if (status == "running")
                 {
-                    last_seen = DateTime.UtcNow.ToString("o"),
-                    hostname = Environment.MachineName,
-                    agent_version = "1.0.0"
-                };
-
-                string json = JsonSerializer.Serialize(heartbeat);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                string url = $"{_config.supabase_url}/rest/v1/agent_keys?secret_key=eq.{_config.secret_key}&deployment_id=eq.{_config.deployment_id}";
-                _httpClient.PatchAsync(url, content).Wait();
-            }
-            catch { }
-        }
-
-        private int FindPattern(byte[] data, byte[] pattern)
-        {
-            for (int i = 0; i < data.Length - pattern.Length; i++)
-            {
-                bool found = true;
-                for (int j = 0; j < pattern.Length; j++)
+                    updateData["started_at"] = DateTime.UtcNow.ToString("o");
+                }
+                else if (status == "completed" || status == "failed")
                 {
-                    if (data[i + j] != pattern[j])
+                    updateData["completed_at"] = DateTime.UtcNow.ToString("o");
+                    if (result != null)
                     {
-                        found = false;
-                        break;
+                        updateData["result"] = result;
                     }
                 }
-                if (found) return i;
+
+                var content = new StringContent(
+                    JsonSerializer.Serialize(updateData),
+                    Encoding.UTF8,
+                    "application/json"
+                );
+
+                var request = new HttpRequestMessage(HttpMethod.Patch, updateUrl)
+                {
+                    Content = content
+                };
+
+                await _httpClient.SendAsync(request);
             }
-            return -1;
+            catch (Exception ex)
+            {
+                LogMessage($"Error updating command status: {ex.Message}");
+            }
         }
 
-        private void LogEvent(string message)
+        private void LogMessage(string message)
         {
+            string logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
+            
+            // Log to file
             try
             {
-                string logPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                    "NEXUS",
-                    "agent.log"
-                );
+                string logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "NEXUS Agent");
+                Directory.CreateDirectory(logDir);
+                string logFile = Path.Combine(logDir, "agent.log");
                 
-                string directory = Path.GetDirectoryName(logPath);
-                if (!string.IsNullOrEmpty(directory))
+                // Keep log file from growing too large
+                if (File.Exists(logFile) && new FileInfo(logFile).Length > 10 * 1024 * 1024) // 10MB
                 {
-                    Directory.CreateDirectory(directory);
+                    File.Delete(logFile);
                 }
                 
-                File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}\n");
+                File.AppendAllText(logFile, logMessage + Environment.NewLine);
             }
-            catch { }
+            catch
+            {
+                // Ignore logging errors
+            }
+
+            // Also log to console if running interactively
+            if (Environment.UserInteractive)
+            {
+                Console.WriteLine(logMessage);
+            }
+        }
+
+        private class AgentRecord
+        {
+            public string Id { get; set; } = "";
         }
     }
 
     public class AgentConfig
     {
-        public string supabase_url { get; set; } = "";
-        public string supabase_key { get; set; } = "";
-        public string deployment_id { get; set; } = "";
-        public string secret_key { get; set; } = "";
+        public string SupabaseUrl { get; set; } = "";
+        public string SupabaseKey { get; set; } = "";
+        public string DeploymentId { get; set; } = "";
+        public string SecretKey { get; set; } = "";
+
+        // JSON property name mapping
+        [System.Text.Json.Serialization.JsonPropertyName("supabase_url")]
+        public string SupabaseUrlAlt { set { SupabaseUrl = value; } }
+        
+        [System.Text.Json.Serialization.JsonPropertyName("supabase_key")]
+        public string SupabaseKeyAlt { set { SupabaseKey = value; } }
+        
+        [System.Text.Json.Serialization.JsonPropertyName("deployment_id")]
+        public string DeploymentIdAlt { set { DeploymentId = value; } }
+        
+        [System.Text.Json.Serialization.JsonPropertyName("secret_key")]
+        public string SecretKeyAlt { set { SecretKey = value; } }
     }
 
     public class AgentCommand
     {
-        public string id { get; set; } = "";
-        public string command_type { get; set; } = "";
-        public string script { get; set; } = "";
+        [System.Text.Json.Serialization.JsonPropertyName("id")]
+        public string Id { get; set; } = "";
+        
+        [System.Text.Json.Serialization.JsonPropertyName("command_type")]
+        public string CommandType { get; set; } = "";
+        
+        [System.Text.Json.Serialization.JsonPropertyName("script")]
+        public string Script { get; set; } = "";
+        
+        [System.Text.Json.Serialization.JsonPropertyName("parameters")]
+        public JsonElement? Parameters { get; set; }
     }
 }
