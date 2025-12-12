@@ -2,59 +2,60 @@ name: Build NEXUS Agent
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-
+    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
+    - uses: actions/checkout@v4
+    
     - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v1
-
+      uses: microsoft/setup-msbuild@v2
+    
     - name: Setup NuGet
       uses: NuGet/setup-nuget@v1
-
+      
     - name: Restore NuGet packages
-      run: nuget restore NexusAgent.csproj
-
-    - name: Build with MSBuild
-      run: msbuild NexusAgent.csproj /p:Configuration=Release /p:Platform="Any CPU"
-
+      run: nuget restore NexusAgent.csproj -PackagesDirectory packages
+    
+    - name: Build
+      run: msbuild NexusAgent.csproj /p:Configuration=Release /p:Platform="Any CPU" /p:OutputPath=bin\Release\
+      
     - name: Create template.exe with placeholder
-      shell: pwsh
+      shell: powershell
       run: |
-        $exePath = "bin\Any CPU\Release\net48\NexusAgent.exe"
-        Write-Host "Looking for: $exePath"
-        
-        if (Test-Path $exePath) {
-          Write-Host "Found executable at $exePath"
-          $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
-          $padding = " " * (500 - $placeholder.Length)
-          $placeholderPadded = $placeholder + $padding
-          
-          $bytes = [System.IO.File]::ReadAllBytes($exePath)
-          $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($placeholderPadded)
-          $newBytes = $bytes + $placeholderBytes
-          [System.IO.File]::WriteAllBytes("template.exe", $newBytes)
-          
-          $size = (Get-Item "template.exe").Length
-          Write-Host "Created template.exe successfully ($size bytes)"
-        } else {
-          Write-Host "ERROR: Executable not found at $exePath"
-          Write-Host "Searching for .exe files..."
-          Get-ChildItem -Recurse -Filter "NexusAgent.exe" | ForEach-Object { Write-Host $_.FullName }
+        $exePath = "bin\Release\NexusAgent.exe"
+        if (!(Test-Path $exePath)) {
+          Write-Error "Build output not found at: $exePath"
+          Get-ChildItem -Recurse -Filter "*.exe" | ForEach-Object { Write-Host $_.FullName }
           exit 1
         }
-
-    - name: Upload template artifact
+        
+        # Read the compiled executable
+        $exeBytes = [System.IO.File]::ReadAllBytes($exePath)
+        
+        # Create placeholder (500 bytes padded with spaces)
+        $placeholder = "<<<NEXUS_CREDENTIALS_PLACEHOLDER>>>"
+        $paddedPlaceholder = $placeholder.PadRight(500, ' ')
+        $placeholderBytes = [System.Text.Encoding]::UTF8.GetBytes($paddedPlaceholder)
+        
+        # Append placeholder to the end of the executable
+        $templateBytes = $exeBytes + $placeholderBytes
+        
+        # Write template.exe
+        $templatePath = "bin\Release\template.exe"
+        [System.IO.File]::WriteAllBytes($templatePath, $templateBytes)
+        
+        Write-Host "Created template.exe ($(([System.IO.FileInfo]$templatePath).Length) bytes)"
+        Write-Host "Placeholder appended at offset: $($exeBytes.Length)"
+    
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: nexus-agent-template
-        path: template.exe
+        path: bin\Release\template.exe
